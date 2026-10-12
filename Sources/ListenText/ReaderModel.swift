@@ -2,11 +2,19 @@ import AppKit
 import AVFoundation
 import Combine
 import ReaderCore
+import CryptoKit
 
 @MainActor
 final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     enum State: String { case ready = "准备就绪", playing = "正在朗读", paused = "已暂停", finished = "朗读完成" }
 
+    @Published private(set) var libraryEntries: [LibraryEntry] = []
+    @Published private(set) var unavailableEntryIDs: Set<UUID> = []
+    @Published private(set) var currentLibraryID: UUID?
+    @Published private(set) var isAddingFiles = false
+    @Published private(set) var libraryNotice: String?
+    @Published private(set) var resumeMarkerOffset: Int?
+    @Published var showClearLibraryConfirmation = false
     @Published private(set) var text = ""
     @Published private(set) var fileURL: URL?
     @Published private(set) var state: State = .ready
@@ -49,6 +57,14 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         didSet { UserDefaults.standard.set(volume, forKey: "volume") }
     }
 
+    private let libraryStore: ReadingLibraryStore
+    private var library = ReadingLibrary()
+    private var canSaveLibrary = true
+    private var playbackCheckpoint: ReadingCheckpoint?
+    private var pendingCheckpoint = false
+    private var lastCheckpointSave = Date.distantPast
+    private var currentDigest = ""
+    private var didRestoreLibrary = false
     private let synthesizer = AVSpeechSynthesizer()
     private let globalShortcut = GlobalShortcut()
     private let voiceFavoritesStore = VoiceFavoritesStore()
@@ -87,7 +103,10 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         return voices.first { $0.id == selectedVoiceID }?.label ?? "所选声音不可用"
     }
 
-    override init() {
+    override convenience init() { self.init(libraryURL: LibraryFiles.storeURL) }
+
+    init(libraryURL: URL, registerShortcut: Bool = true) {
+        libraryStore = ReadingLibraryStore(url: libraryURL)
         let defaults = UserDefaults.standard
         selectedVoiceID = defaults.string(forKey: "voiceID") ?? ""
         rate = defaults.object(forKey: "rate") == nil ? 0.5 : min(0.7, max(0.25, defaults.double(forKey: "rate")))
@@ -99,7 +118,15 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         favoriteVoices = voiceFavoritesStore.load()
         synthesizer.delegate = self
         globalShortcut.action = { [weak self] in self?.togglePlayback() }
-        shortcutAvailable = globalShortcut.register(shortcut)
+        if registerShortcut { shortcutAvailable = globalShortcut.register(shortcut) }
+        do {
+            library = try libraryStore.load()
+            libraryEntries = library.sortedEntries
+            refreshLibraryAvailability()
+        } catch {
+            canSaveLibrary = false
+            errorMessage = "无法读取书架记录。原记录已保留，请检查文件：\(libraryStore.url.path)\n\(error.localizedDescription)"
+        }
         Task { await refreshVoices() }
     }
 
@@ -144,13 +171,14 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
 
     func openPanel() {
         let panel = NSOpenPanel()
-        panel.title = "选择要朗读的文件"
+        panel.title = "添加文本到书架"
         panel.message = "支持 TXT、Markdown、RTF、HTML、DOCX、PDF 和常见纯文本文件（最大 20 MB）。"
         panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in await self?.load(url) }
+            guard response == .OK else { return }
+            let urls = panel.urls
+            Task { @MainActor in await self?.addFiles(urls) }
         }
         if let window = NSApp.keyWindow, window.identifier?.rawValue == "reader" {
             panel.beginSheetModal(for: window, completionHandler: completion)
@@ -161,10 +189,11 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
 
     func openExample() {
         guard let url = Bundle.main.url(forResource: "示例文本", withExtension: "txt") else { return }
-        Task { await load(url) }
+        Task { await load(url, remember: false) }
     }
 
-    func load(_ url: URL) async {
+    @discardableResult
+    func load(_ url: URL, remember: Bool = true, restoringID: UUID? = nil) async -> Bool {
         let generation = UUID()
         loadGeneration = generation
         isLoading = true
@@ -174,10 +203,17 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         do {
             let loaded = try await DocumentImporter.load(url)
             let index = await Task.detached(priority: .userInitiated) {
-                (ChapterParser.chapters(in: loaded), (loaded as NSString).length, loaded.count)
+                (ChapterParser.chapters(in: loaded), (loaded as NSString).length, loaded.count, Self.digest(loaded))
             }.value
-            guard generation == loadGeneration else { return }
+            guard generation == loadGeneration else { return false }
             stop()
+            let entry = remember ? try registerFile(url, textDigest: index.3, replacingID: restoringID, opening: true) : nil
+            currentLibraryID = entry?.id
+            currentDigest = index.3
+            playbackCheckpoint = entry?.checkpoint
+            pendingCheckpoint = false
+            resumeMarkerOffset = nil
+            libraryNotice = nil
             text = loaded
             documentSource = loaded as NSString
             textLength = index.1
@@ -192,9 +228,30 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
             spokenRange = NSRange(location: 0, length: 0)
             state = .ready
             errorMessage = nil
+            if let checkpoint = entry?.checkpoint {
+                let unchanged = entry?.contentDigest == currentDigest
+                let restored = checkpoint.restore(in: loaded, chapters: chapters, unchanged: unchanged)
+                position = restored.offset
+                if let chapter = ChapterParser.chapterIndex(at: position, in: chapters) { displayChapter(chapter) }
+                selectionOffset = position
+                resumeMarkerOffset = position < textLength ? position : nil
+                if let chapter = currentChapter {
+                    focusRequest = TextFocusRequest(range: NSRange(location: min(chapter.range.length, max(0, position - chapter.range.location)), length: 0))
+                }
+                state = unchanged && checkpoint.finished ? .finished : .ready
+                if !unchanged {
+                    libraryNotice = restored.exact ? "文件内容已更新，已找到上次播放的位置。" : "文件内容已变化，无法准确恢复；已定位到对应章节开头。"
+                    playbackCheckpoint = ReadingCheckpoint(text: loaded, chapters: chapters, offset: position)
+                    pendingCheckpoint = true
+                    flushReadingProgress()
+                }
+            }
+            return true
         } catch {
-            guard generation == loadGeneration else { return }
+            guard generation == loadGeneration else { return false }
             errorMessage = error.localizedDescription
+            if let restoringID { unavailableEntryIDs.insert(restoringID) }
+            return false
         }
     }
 
@@ -205,6 +262,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         case .playing:
             state = .paused
             if didStartCurrentUtterance { _ = synthesizer.pauseSpeaking(at: .immediate) }
+            flushReadingProgress()
         case .paused:
             state = .playing
             if utterance == nil { beginReading(from: position) }
@@ -216,6 +274,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
     }
 
     func stop() {
+        flushReadingProgress()
         utterance = nil // Ignore late callbacks from cancelled speech.
         _ = synthesizer.stopSpeaking(at: .immediate)
         state = .ready
@@ -229,6 +288,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         selectionOffset = 0
         spokenRange = NSRange(location: 0, length: 0)
         focusRequest = TextFocusRequest(range: NSRange(location: 0, length: 0))
+        captureReadingProgress(immediate: true)
     }
 
     func seek(to fraction: Double) {
@@ -238,6 +298,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         position = requested < textLength ? documentSource.rangeOfComposedCharacterSequence(at: requested).location : requested
         if let index = ChapterParser.chapterIndex(at: position, in: chapters) { displayChapter(index) }
         spokenRange = NSRange(location: position, length: 0)
+        captureReadingProgress(immediate: true)
         if wasPlaying { beginReading(from: position) }
     }
 
@@ -248,6 +309,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         let requested = chapter.range.location + Int(Double(chapter.range.length) * min(1, max(0, fraction)))
         position = requested < textLength ? documentSource.rangeOfComposedCharacterSequence(at: requested).location : requested
         spokenRange = NSRange(location: position, length: 0)
+        captureReadingProgress(immediate: true)
         if wasPlaying { beginReading(from: position) }
     }
 
@@ -259,6 +321,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         selectionOffset = position
         spokenRange = NSRange(location: position, length: 0)
         focusRequest = TextFocusRequest(range: NSRange(location: 0, length: 0))
+        resumeMarkerOffset = nil
     }
 
     func moveChapter(by amount: Int) {
@@ -267,7 +330,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
     }
 
     func restartChapter() {
-        if let id = selectedChapterID { selectChapter(id) }
+        if let id = selectedChapterID { selectChapter(id); captureReadingProgress(immediate: true) }
     }
 
     func setSelection(_ offset: Int, chapterID: Int?) {
@@ -364,6 +427,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         }
         segmentIndex = 0
         state = .playing
+        captureReadingProgress(immediate: true)
         speakNext()
     }
 
@@ -382,6 +446,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
             position = textLength
             spokenRange = NSRange(location: textLength, length: 0)
             state = .finished
+            captureReadingProgress(immediate: true)
             return
         }
         guard state == .playing else { utterance = nil; return }
@@ -395,6 +460,185 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         didStartCurrentUtterance = false
         synthesizer.speak(next)
     }
+
+
+    nonisolated private static func digest(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func saveLibrary(_ next: ReadingLibrary) throws {
+        guard canSaveLibrary else { throw CocoaError(.fileReadCorruptFile) }
+        try libraryStore.save(next)
+        library = next
+        libraryEntries = next.sortedEntries
+    }
+
+    private func registerFile(_ url: URL, textDigest: String, replacingID: UUID? = nil, opening: Bool) throws -> LibraryEntry {
+        let canonical = LibraryFiles.canonical(url)
+        let identity = LibraryFiles.identity(canonical)
+        let existingID = library.entries.first { entry in
+            if let identity, entry.fileIdentity == identity { return true }
+            guard entry.path == canonical.path else { return false }
+            // A new file can occupy the old path after the original was moved.
+            let resolved = LibraryFiles.resolve(bookmark: entry.bookmark, path: entry.path)
+            return LibraryFiles.canonical(resolved).path == canonical.path
+        }?.id
+        if let replacingID, let existingID, replacingID != existingID {
+            throw LibraryError.alreadyAdded
+        }
+        let id = replacingID ?? existingID
+        var entry = id.flatMap { id in library.entries.first { $0.id == id } } ??
+            LibraryEntry(name: canonical.lastPathComponent, path: canonical.path, contentDigest: textDigest)
+        // Keep the previous digest until its checkpoint has been restored against the new text.
+        entry.name = canonical.lastPathComponent
+        entry.path = canonical.path
+        entry.fileIdentity = identity
+        entry.bookmark = LibraryFiles.bookmark(url)
+        if opening { entry.lastOpenedAt = Date() }
+        var next = library
+        if let index = next.entries.firstIndex(where: { $0.id == entry.id }) { next.entries[index] = entry }
+        else { next.entries.append(entry) }
+        if opening { next.lastOpenedID = entry.id }
+        try saveLibrary(next)
+        unavailableEntryIDs.remove(entry.id)
+        return entry
+    }
+
+    func addFiles(_ urls: [URL]) async {
+        guard !isAddingFiles else { return }
+        isAddingFiles = true
+        defer { isAddingFiles = false }
+        var opened = false
+        var failures: [String] = []
+        for url in urls {
+            if !opened {
+                if await load(url) { opened = true }
+                else { failures.append("\(url.lastPathComponent)：\(errorMessage ?? "无法读取")") }
+            } else {
+                let accessed = url.startAccessingSecurityScopedResource()
+                do {
+                    let content = try await DocumentImporter.load(url)
+                    let digest = await Task.detached { Self.digest(content) }.value
+                    _ = try registerFile(url, textDigest: digest, opening: false)
+                } catch { failures.append("\(url.lastPathComponent)：\(error.localizedDescription)") }
+                if accessed { url.stopAccessingSecurityScopedResource() }
+            }
+        }
+        if !failures.isEmpty { errorMessage = "部分文件未能添加：\n" + failures.joined(separator: "\n") }
+    }
+
+    func restoreLastDocument() async {
+        guard !didRestoreLibrary else { return }
+        didRestoreLibrary = true
+        guard !hasText, !isLoading, !isAddingFiles, let id = library.lastOpenedID else { return }
+        await openLibraryEntry(id)
+    }
+
+    func openLibraryEntry(_ id: UUID) async {
+        guard let entry = library.entries.first(where: { $0.id == id }) else { return }
+        if currentLibraryID == id { stop() } // Flush before reading this entry's saved checkpoint.
+        let url = LibraryFiles.resolve(bookmark: entry.bookmark, path: entry.path)
+        await load(url, restoringID: id)
+    }
+
+    func refreshLibraryAvailability() {
+        unavailableEntryIDs = Set(library.entries.compactMap { entry in
+            let url = LibraryFiles.resolve(bookmark: entry.bookmark, path: entry.path)
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            return FileManager.default.isReadableFile(atPath: url.path) ? nil : entry.id
+        })
+    }
+
+    func relocateLibraryEntry(_ id: UUID) {
+        let panel = NSOpenPanel()
+        panel.title = "重新定位书架文件"
+        panel.message = "选择对应文件，保留原有阅读记录。"
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in await self?.load(url, restoringID: id) }
+        }
+    }
+
+    func removeLibraryEntry(_ id: UUID) {
+        guard !isLoading, !isAddingFiles else { return }
+        if currentLibraryID == id { stop() }
+        var next = library
+        next.remove(id)
+        do {
+            try saveLibrary(next)
+            unavailableEntryIDs.remove(id)
+            if currentLibraryID == id { closeDocument() }
+        } catch { errorMessage = "无法移除书架记录：\(error.localizedDescription)" }
+    }
+
+    func clearLibrary() {
+        guard !isLoading, !isAddingFiles else { return }
+        stop()
+        do {
+            try saveLibrary(ReadingLibrary())
+            unavailableEntryIDs = []
+            closeDocument()
+        } catch { errorMessage = "无法清空书架：\(error.localizedDescription)" }
+    }
+
+    private func closeDocument() {
+        loadGeneration = UUID()
+        currentLibraryID = nil
+        playbackCheckpoint = nil
+        pendingCheckpoint = false
+        fileURL = nil
+        text = ""
+        documentSource = ""
+        chapters = []
+        selectedChapterID = nil
+        displayedText = ""
+        displayedTextID = UUID()
+        textLength = 0
+        characterCount = 0
+        searchQuery = ""
+        spokenRange = NSRange(location: 0, length: 0)
+        position = 0
+        selectionOffset = 0
+        resumeMarkerOffset = nil
+        libraryNotice = nil
+    }
+
+    private func captureReadingProgress(immediate: Bool = false) {
+        guard currentLibraryID != nil, hasText else { return }
+        resumeMarkerOffset = nil
+        playbackCheckpoint = ReadingCheckpoint(source: documentSource, chapters: chapters, offset: position, finished: state == .finished)
+        pendingCheckpoint = true
+        if immediate || Date().timeIntervalSince(lastCheckpointSave) >= 2 { flushReadingProgress() }
+    }
+
+    func flushReadingProgress() {
+        guard pendingCheckpoint, let id = currentLibraryID, let checkpoint = playbackCheckpoint,
+              let index = library.entries.firstIndex(where: { $0.id == id }) else { return }
+        var next = library
+        next.entries[index].checkpoint = checkpoint
+        next.entries[index].contentDigest = currentDigest
+        next.entries[index].lastReadAt = Date()
+        do {
+            try saveLibrary(next)
+            pendingCheckpoint = false
+            lastCheckpointSave = Date()
+        } catch {
+            // Keep the pending checkpoint for retry; do not overwrite the previous disk record.
+            if libraryNotice == nil { libraryNotice = "阅读进度保存失败：\(error.localizedDescription)" }
+        }
+    }
+
+    var localResumeRange: NSRange {
+        guard let offset = resumeMarkerOffset, let chapter = currentChapter,
+              offset >= chapter.range.location, offset < NSMaxRange(chapter.range) else { return NSRange(location: 0, length: 0) }
+        let range = documentSource.rangeOfComposedCharacterSequence(at: offset)
+        return NSRange(location: range.location - chapter.range.location, length: range.length)
+    }
+
+    func dismissLibraryNotice() { libraryNotice = nil }
 
     func saveShortcut(_ candidate: KeyboardShortcut) -> Bool {
         guard globalShortcut.register(candidate) else { return false }
@@ -423,6 +667,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
             let absolute = NSRange(location: self.segments[self.segmentIndex].range.location + range.location, length: range.length)
             self.position = absolute.location
             self.spokenRange = absolute
+            self.captureReadingProgress()
         }
     }
 
@@ -441,6 +686,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
             guard let self, self.utterance === utterance else { return }
             self.utterance = nil
             self.state = .ready
+            self.flushReadingProgress()
             self.errorMessage = "系统停止了朗读，请重新播放。若仍无声音，请检查声音资源和音频输出设备。"
         }
     }
@@ -449,4 +695,9 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
 struct TextFocusRequest: Equatable {
     let id = UUID()
     let range: NSRange
+}
+
+private enum LibraryError: LocalizedError {
+    case alreadyAdded
+    var errorDescription: String? { "所选文件已经在书架中，请打开已有条目，或选择另一个文件。" }
 }

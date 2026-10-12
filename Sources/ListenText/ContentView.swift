@@ -4,10 +4,11 @@ import ReaderCore
 import AVFoundation
 
 struct ContentView: View {
-    private enum SidebarTab: String, CaseIterable { case contents = "目录", search = "搜索" }
+    private enum SidebarTab: String, CaseIterable { case library = "书架", contents = "目录", search = "搜索" }
     @ObservedObject var model: ReaderModel
     @AppStorage("showsChapterSidebar") private var showsSidebar = true
-    @State private var sidebarTab: SidebarTab = .contents
+    @State private var sidebarTab: SidebarTab = .library
+    @State private var libraryQuery = ""
     @State private var showSettings = false
     @State private var seekValue = 0.0
     @State private var isSeeking = false
@@ -27,11 +28,19 @@ struct ContentView: View {
                     chapterHeader
                     Divider()
                 }
+                if let notice = model.libraryNotice {
+                    HStack {
+                        Text(notice).font(.callout)
+                        Spacer()
+                        Button(action: model.dismissLibraryNotice) { Image(systemName: "xmark") }
+                            .buttonStyle(.plain).accessibilityLabel("关闭书架提示")
+                    }.padding(12).background(Color.accentColor.opacity(0.08))
+                }
                 ZStack {
                     if model.hasText {
                         let chapterID = model.selectedChapterID
                         ReaderTextView(text: model.displayedText, textID: model.displayedTextID,
-                                       highlightedRange: model.localSpokenRange,
+                                       highlightedRange: model.localSpokenRange.length > 0 ? model.localSpokenRange : model.localResumeRange,
                                        searchRanges: model.searchHighlights, focusRequest: model.focusRequest,
                                        followsReading: model.followsReading,
                                        onSelection: { model.setSelection($0, chapterID: chapterID) },
@@ -58,9 +67,16 @@ struct ContentView: View {
             }
         }
         .onDrop(of: [.fileURL], isTargeted: $isDropping) { providers in
-            guard let provider = providers.first else { return false }
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                if let url { Task { @MainActor in await model.load(url) } }
+            guard !providers.isEmpty, !model.isAddingFiles else { return false }
+            Task { @MainActor in
+                var urls: [URL] = []
+                for provider in providers {
+                    let url: URL? = await withCheckedContinuation { continuation in
+                        _ = provider.loadObject(ofClass: URL.self) { url, _ in continuation.resume(returning: url) }
+                    }
+                    if let url { urls.append(url) }
+                }
+                await model.addFiles(urls)
             }
             return true
         }
@@ -75,7 +91,12 @@ struct ContentView: View {
         .alert("无法完成操作", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("好", role: .cancel) { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
+        .alert("清空书架？", isPresented: $model.showClearLibraryConfirmation) {
+            Button("取消", role: .cancel) {}
+            Button("清空书架", role: .destructive) { model.clearLibrary() }
+        } message: { Text("将移除全部文件记录和阅读进度，磁盘上的原文件不会被删除。") }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.refreshLibraryAvailability()
             Task { await model.refreshVoices() }
         }
         .onReceive(NotificationCenter.default.publisher(for: AVSpeechSynthesizer.availableVoicesDidChangeNotification)) { _ in
@@ -94,8 +115,24 @@ struct ContentView: View {
                 Spacer()
             }.padding(.top, 8)
             Button(action: model.openPanel) {
-                Label("打开文本文件", systemImage: "folder.badge.plus").frame(maxWidth: .infinity)
-            }.controlSize(.large).buttonStyle(.borderedProminent)
+                Label(model.isAddingFiles ? "正在添加…" : "添加文本文件", systemImage: "folder.badge.plus").frame(maxWidth: .infinity)
+            }.controlSize(.large).buttonStyle(.borderedProminent).disabled(model.isAddingFiles || model.isLoading)
+            Picker("侧栏内容", selection: $sidebarTab) {
+                ForEach(SidebarTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }.pickerStyle(.segmented).labelsHidden()
+            if sidebarTab == .library {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("查找书架文件", text: $libraryQuery).textFieldStyle(.plain)
+                    Menu {
+                        Button("刷新文件状态", action: model.refreshLibraryAvailability)
+                        Divider()
+                        Button("清空书架…", role: .destructive) { model.showClearLibraryConfirmation = true }
+                            .disabled(model.libraryEntries.isEmpty || model.isLoading || model.isAddingFiles)
+                    } label: { Image(systemName: "ellipsis.circle") }
+                        .menuStyle(.borderlessButton).fixedSize().help("管理书架").accessibilityLabel("管理书架")
+                }.padding(10).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
+            } else {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("搜索全文", text: $model.searchQuery)
@@ -105,9 +142,7 @@ struct ContentView: View {
                         .buttonStyle(.plain).help("清除搜索").accessibilityLabel("清除搜索")
                 }
             }.padding(10).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
-            Picker("侧栏内容", selection: $sidebarTab) {
-                ForEach(SidebarTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-            }.pickerStyle(.segmented).labelsHidden()
+            }
             if sidebarTab == .search {
                 HStack(spacing: 8) {
                     if model.isSearching { ProgressView().controlSize(.small) }
@@ -119,7 +154,14 @@ struct ContentView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        if sidebarTab == .contents {
+                        if sidebarTab == .library {
+                            ForEach(filteredLibrary) { entry in libraryRow(entry) }
+                            if model.libraryEntries.isEmpty {
+                                sidebarMessage("添加本地文本到书架，\n下次打开即可继续阅读", icon: "books.vertical")
+                            } else if filteredLibrary.isEmpty {
+                                sidebarMessage("没有匹配的文件", icon: "magnifyingglass")
+                            }
+                        } else if sidebarTab == .contents {
                             ForEach(model.chapters) { chapter in
                                 Button { model.selectChapter(chapter.id) } label: {
                                     Text(chapter.title).font(.system(size: 13)).lineLimit(2)
@@ -162,16 +204,57 @@ struct ContentView: View {
                 .onChange(of: sidebarTab) { _, tab in
                     if tab == .contents, let id = model.selectedChapterID { proxy.scrollTo(id, anchor: .center) }
                 }
-            }.disabled(model.isLoading)
+            }.disabled(model.isLoading || model.isAddingFiles)
             Divider()
             HStack {
-                Text("\(model.chapters.count) 个章节").font(.caption).foregroundStyle(.secondary)
+                Text(sidebarTab == .library ? "\(model.libraryEntries.count) 个文件" : "\(model.chapters.count) 个章节").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button { showSettings = true } label: { Label("朗读设置", systemImage: "slider.horizontal.3") }
                     .buttonStyle(.plain).font(.caption)
             }
         }.padding(.horizontal, 17).padding(.vertical, 17)
             .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var filteredLibrary: [LibraryEntry] {
+        let query = libraryQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return query.isEmpty ? model.libraryEntries : model.libraryEntries.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    private func libraryStatus(_ entry: LibraryEntry) -> String {
+        if model.unavailableEntryIDs.contains(entry.id) { return "文件不可用 · 请重新定位" }
+        guard let checkpoint = entry.checkpoint else { return "未开始" }
+        if checkpoint.finished { return "已读完" }
+        return "\(checkpoint.chapterTitle) · 全书 \(Int(entry.progress * 100))%"
+    }
+
+    private func libraryRow(_ entry: LibraryEntry) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Button { Task { await model.openLibraryEntry(entry.id) } } label: {
+                VStack(alignment: .leading, spacing: 7) {
+                    Label(entry.name, systemImage: model.unavailableEntryIDs.contains(entry.id) ? "doc.badge.ellipsis" : "doc.text")
+                        .font(.system(size: 13, weight: .medium)).lineLimit(2)
+                    Text(libraryStatus(entry)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    if let date = entry.lastReadAt {
+                        Text("上次阅读 \(date.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }.buttonStyle(.plain).help(entry.path).accessibilityIdentifier("library-\(entry.id)")
+            Menu {
+                Button("打开并恢复进度") { Task { await model.openLibraryEntry(entry.id) } }
+                Button("重新定位文件…") { model.relocateLibraryEntry(entry.id) }
+                Divider()
+                Button("从书架移除", role: .destructive) { model.removeLibraryEntry(entry.id) }
+            } label: { Image(systemName: "ellipsis") }
+                .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("管理 \(entry.name)")
+        }.padding(11)
+            .background(model.currentLibraryID == entry.id ? Color.accentColor.opacity(0.14) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8))
+            .contextMenu {
+                Button("重新定位文件…") { model.relocateLibraryEntry(entry.id) }
+                Button("从书架移除", role: .destructive) { model.removeLibraryEntry(entry.id) }
+            }
     }
 
     private func rowBackground(_ id: Int) -> Color {
@@ -188,7 +271,7 @@ struct ContentView: View {
     private var documentHeader: some View {
         HStack(spacing: 14) {
             Button { showsSidebar.toggle() } label: { Image(systemName: "sidebar.left") }
-                .help(showsSidebar ? "收起章节侧栏" : "展开章节侧栏").accessibilityLabel("切换章节侧栏")
+                .help(showsSidebar ? "收起侧栏" : "展开侧栏").accessibilityLabel("切换侧栏")
             VStack(alignment: .leading, spacing: 4) {
                 Text(model.title).font(.headline).lineLimit(1).truncationMode(.middle)
                 Text(model.hasText ? "\(model.characterCount.formatted()) 个字符 · \(model.chapters.count) 个章节" : "选择文件，或将文件拖到这里")
@@ -233,7 +316,7 @@ struct ContentView: View {
             Image(systemName: "book.pages").font(.system(size: 45, weight: .light)).foregroundStyle(.tint)
                 .frame(width: 92, height: 92).background(Color.accentColor.opacity(0.08), in: Circle())
             Text("阅读，也可以用听的。").font(.system(size: 25, weight: .medium))
-            Text("按章节阅读，用熟悉的系统声音朗读。\n输入关键词，找到你想听的那一段。")
+            Text("添加文件到书架，下次打开继续阅读。\n按章节朗读，搜索你想听的那一段。")
                 .foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(5)
             HStack(spacing: 12) {
                 Button("选择文件…", action: model.openPanel)
@@ -258,7 +341,7 @@ struct ContentView: View {
                 Button(action: model.restartChapter) { Image(systemName: "backward.end.fill").frame(width: 24, height: 24) }
                     .help("回到本章开头").accessibilityLabel("回到本章开头")
                 Button(action: model.togglePlayback) {
-                    Label(model.isPlaying ? "暂停" : model.state == .paused ? "继续朗读" : "开始朗读",
+                    Label(model.isPlaying ? "暂停" : (model.state == .paused || model.resumeMarkerOffset != nil) ? "继续朗读" : model.state == .finished ? "重新开始" : "开始朗读",
                           systemImage: model.isPlaying ? "pause.fill" : "play.fill")
                         .frame(minWidth: 105).padding(.vertical, 4)
                 }.buttonStyle(.borderedProminent).controlSize(.large)

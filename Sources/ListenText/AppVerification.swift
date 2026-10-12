@@ -110,6 +110,7 @@ enum AppVerification {
             let pausedPosition = model.position
             try? await Task.sleep(for: .milliseconds(1200))
             record("pause-preserves-position", model.state == .paused && model.position == pausedPosition, "position=\(model.position)")
+            record("pause-saves-library-speech-checkpoint", model.libraryEntries.first { $0.id == model.currentLibraryID }?.checkpoint?.offset == pausedPosition)
             model.togglePlayback()
             let resumed = await waitFor({ model.position > pausedPosition && model.state == .playing })
             record("resume-continues", resumed, "position=\(model.position)")
@@ -184,6 +185,7 @@ enum AppVerification {
                     record("real-book-result-navigation-and-highlights", model.selectedChapterID == result.chapterID && valid && !model.searchHighlights.isEmpty)
                 }
             }
+            try await verifyLibrary(folder: folder, record: record)
         } catch { record("unexpected-error", false, error.localizedDescription) }
         model.stop()
         model.rate = savedRate
@@ -199,5 +201,84 @@ enum AppVerification {
             try? data.write(to: reportURL, options: .atomic)
         }
         NSApp.terminate(nil)
+    }
+
+    private static func verifyLibrary(folder: URL, record: (String, Bool, String) -> Void) async throws {
+        let libraryURL = folder.appendingPathComponent("library-test/state.json")
+        let store = ReadingLibraryStore(url: libraryURL)
+        let firstURL = folder.appendingPathComponent("第一本.txt")
+        let secondURL = folder.appendingPathComponent("第二本.txt")
+        let invalidURL = folder.appendingPathComponent("不支持.bin")
+        let content = "第1章 起点\n这是第一章的文字。\n第2章 续读\n上次播放的位置应该正确恢复🌙。" +
+            (1...12).map { "第\($0)段续读检查内容。" }.joined()
+        try content.write(to: firstURL, atomically: true, encoding: .utf8)
+        try "另一本文本，应该拥有独立的进度。".write(to: secondURL, atomically: true, encoding: .utf8)
+        try Data([0, 1, 2]).write(to: invalidURL)
+        let reader = ReaderModel(libraryURL: libraryURL, registerShortcut: false)
+        await reader.addFiles([firstURL, invalidURL, secondURL])
+        record("library-multiple-import-and-failed-file-exclusion", reader.libraryEntries.count == 2 && reader.currentLibraryID != nil && reader.state == .ready, "")
+        reader.errorMessage = nil
+        guard let firstID = reader.libraryEntries.first(where: { $0.path == firstURL.path })?.id,
+              let secondID = reader.libraryEntries.first(where: { $0.path == secondURL.path })?.id else {
+            record("library-fixtures", false, "Missing entries"); return
+        }
+        reader.selectChapter(1)
+        reader.seekInChapter(to: 0.42)
+        let savedPosition = reader.position
+        reader.selectChapter(0)
+        reader.searchQuery = "这是"
+        try? await Task.sleep(for: .milliseconds(500))
+        if let result = reader.searchResults.first { reader.showSearchResult(result) }
+        reader.stop()
+        record("library-browsing-does-not-overwrite-playback", try store.load().entries.first { $0.id == firstID }?.checkpoint?.offset == savedPosition, "")
+
+        let reopened = ReaderModel(libraryURL: libraryURL, registerShortcut: false)
+        await reopened.restoreLastDocument()
+        record("library-relaunch-restores-file-chapter-position-without-speaking",
+               reopened.currentLibraryID == firstID && reopened.selectedChapterID == 1 && reopened.position == savedPosition &&
+               reopened.state == .ready && reopened.focusRequest != nil && reopened.localResumeRange.length > 0, "position=\(reopened.position)")
+        await reopened.openLibraryEntry(secondID)
+        reopened.seek(to: 0.3)
+        let secondPosition = reopened.position
+        await reopened.openLibraryEntry(firstID)
+        let independentSnapshot = try store.load()
+        record("library-independent-file-progress", reopened.position == savedPosition &&
+               independentSnapshot.entries.first { $0.id == secondID }?.checkpoint?.offset == secondPosition, "")
+        await reopened.addFiles([firstURL])
+        record("library-deduplicates-and-retains-progress", reopened.libraryEntries.count == 2 && reopened.position == savedPosition, "")
+
+        let movedURL = folder.appendingPathComponent("重命名后的第一本.txt")
+        try FileManager.default.moveItem(at: firstURL, to: movedURL)
+        reopened.refreshLibraryAvailability()
+        await reopened.openLibraryEntry(firstID)
+        record("library-bookmark-follows-rename", reopened.fileURL.map(LibraryFiles.canonical)?.path == LibraryFiles.canonical(movedURL).path && reopened.position == savedPosition && !reopened.unavailableEntryIDs.contains(firstID), "path=\(reopened.fileURL?.path ?? "none"), position=\(reopened.position), error=\(reopened.errorMessage ?? "none")")
+        try "这是占用旧路径的另一份文件。".write(to: firstURL, atomically: true, encoding: .utf8)
+        await reopened.addFiles([firstURL])
+        let newID = reopened.currentLibraryID
+        record("library-new-file-at-old-path-keeps-separate-record", newID != firstID && reopened.libraryEntries.count == 3, "")
+        if let newID, newID != firstID { reopened.removeLibraryEntry(newID) }
+        await reopened.openLibraryEntry(firstID)
+        let oldContent = content
+        let newContent = "新增前言。\n" + oldContent
+        try newContent.write(to: movedURL, atomically: true, encoding: .utf8)
+        await reopened.openLibraryEntry(firstID)
+        record("library-changed-content-restores-anchor", reopened.position == savedPosition + ("新增前言。\n" as NSString).length && reopened.libraryNotice != nil, "position=\(reopened.position), expected=\(savedPosition + ("新增前言。\n" as NSString).length), notice=\(reopened.libraryNotice ?? "none")")
+
+        try FileManager.default.removeItem(at: secondURL)
+        reopened.refreshLibraryAvailability()
+        await reopened.openLibraryEntry(secondID)
+        record("library-missing-file-keeps-entry-and-current-document", reopened.unavailableEntryIDs.contains(secondID) && reopened.libraryEntries.count == 2 && reopened.currentLibraryID == firstID, "")
+        reopened.errorMessage = nil
+        let replacement = folder.appendingPathComponent("重新定位的第二本.txt")
+        try "另一本文本，应该拥有独立的进度。".write(to: replacement, atomically: true, encoding: .utf8)
+        await reopened.load(replacement, restoringID: secondID)
+        record("library-relink-retains-id-and-progress", reopened.currentLibraryID == secondID && reopened.position == secondPosition && reopened.libraryEntries.count == 2 && !reopened.unavailableEntryIDs.contains(secondID), "")
+        reopened.removeLibraryEntry(secondID)
+        record("library-remove-closes-current-and-preserves-original", !reopened.hasText && reopened.currentLibraryID == nil && reopened.libraryEntries.count == 1 && FileManager.default.fileExists(atPath: replacement.path), "")
+        await reopened.openLibraryEntry(firstID)
+        reopened.clearLibrary()
+        let clearedSnapshot = try store.load()
+        record("library-clear-persists-and-preserves-original", reopened.libraryEntries.isEmpty && !reopened.hasText && clearedSnapshot.entries.isEmpty && FileManager.default.fileExists(atPath: movedURL.path), "")
+        reader.stop(); reopened.stop()
     }
 }

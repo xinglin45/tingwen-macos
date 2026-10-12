@@ -5,7 +5,8 @@ import AVFoundation
 @main
 struct ListenTextApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var model = ReaderModel()
+    @StateObject private var model = ReaderModel(libraryURL: CommandLine.arguments.contains("--verify") ?
+        FileManager.default.temporaryDirectory.appendingPathComponent("ListenText-VerificationLibrary-\(UUID().uuidString)").appendingPathComponent("library.json") : LibraryFiles.storeURL)
     @State private var startedVerification = false
 
     var body: some Scene {
@@ -22,6 +23,9 @@ struct ListenTextApp: App {
                         } else { bookURL = nil }
                         Task { await AppVerification.run(model: model, reportURL: URL(fileURLWithPath: arguments[index + 1]), bookURL: bookURL) }
                     }
+                }
+                .task {
+                    if !CommandLine.arguments.contains("--verify") { await model.restoreLastDocument() }
                 }
                 .onOpenURL { url in Task { await model.load(url) } }
         }
