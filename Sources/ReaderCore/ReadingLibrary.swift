@@ -56,6 +56,9 @@ public struct LibraryEntry: Codable, Identifiable, Equatable, Sendable {
     public var bookmark: Data?
     public var fileIdentity: String?
     public var contentDigest: String
+    public var sourceEncoding: String?
+    public var encodingOverride: String?
+    public var convertedUTF8Path: String?
     public var checkpoint: ReadingCheckpoint?
     public let addedAt: Date
     public var lastOpenedAt: Date

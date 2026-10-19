@@ -2,6 +2,40 @@ import XCTest
 @testable import ReaderCore
 
 final class ChapterTests: XCTestCase {
+    func testUnspacedChineseHeadingsWrappersAndInvisibleMarks() {
+        let text = "作品简介\n第一章拍花造畜\n第一章正文。\n　　第二章阴沟里翻船\n第二章正文。\n【第三章外道三十六术】\n正文。\n\u{200B}第\u{200E}四\u{200B}章顶壳借神\n正文。\n（第五章结束）\n正文。\n【尾声】\n完。"
+        let chapters = ChapterParser.chapters(in: text)
+        XCTAssertEqual(chapters.map(\.title), ["作品信息 / 前言", "第一章拍花造畜", "第二章阴沟里翻船", "第三章外道三十六术", "第四章顶壳借神", "第五章结束", "尾声"])
+        XCTAssertEqual(chapters.map { $0.text(in: text) }.joined(), text)
+        XCTAssertTrue(chapters.allSatisfy { Range($0.range, in: text) != nil })
+    }
+
+    func testNumberedTitlesChineseNumbersAndFullwidthNumbers() {
+        for text in ["001 开始\n正文。\n002 继续\n正文。\n003 结束\n正文。",
+                     "１．开始\n正文。\n２．继续\n正文。\n３．结束\n正文。",
+                     "一、开始\n正文。\n二、继续\n正文。\n三、结束\n正文。"] {
+            let chapters = ChapterParser.chapters(in: text)
+            XCTAssertEqual(chapters.count, 3)
+            XCTAssertEqual(chapters.map { $0.text(in: text) }.joined(), text)
+        }
+    }
+
+    func testVolumesPrefixedChaptersAndCompactEnglishTitles() {
+        let text = "第一卷风起\n正文。\n正文 第1章无空格\n正文。\n第2回再会\n正文。\nChapter1: Start\nHello.\nCHAPTER II End\nBye."
+        XCTAssertEqual(ChapterParser.chapters(in: text).map(\.title),
+                       ["第一卷风起", "正文 第1章无空格", "第2回再会", "Chapter1: Start", "CHAPTER II End"])
+    }
+
+    func testBodyReferencesAndDatesDoNotBecomeChapters() {
+        let text = "第一章拍花造畜\n第三部分则是处置方案，共有七条。\n第二篇字写完，我放下笔。\n第一回是说以前的事情。\n他提到了第二章但还没读。\n2026.10.13 日期\n1. 一句正文。\n第二章阴沟里翻船\n正文。"
+        XCTAssertEqual(ChapterParser.chapters(in: text).map(\.title), ["第一章拍花造畜", "第二章阴沟里翻船"])
+        XCTAssertEqual(ChapterParser.chapters(in: "42. 单个条目\n没有连贯章号。").first?.title, "全文")
+        XCTAssertEqual(ChapterParser.chapters(in: "1. 苹果\n2. 香蕉\n3. 橘子").first?.title, "全文")
+        XCTAssertEqual(ChapterParser.chapters(in: "\(Int.max). 编号\n正文。\n\(Int.max - 1). 编号\n正文。").first?.title, "全文")
+        XCTAssertEqual(ChapterParser.chapters(in: "第1章 开始\n1. 苹果\n2. 香蕉\n第2章 结束。").map(\.title),
+                       ["第1章 开始", "第2章 结束。"])
+    }
+
     func testChineseChaptersPreservePreambleAndFullDocument() {
         let text = "作品介绍🌙\n\n第1章 开始\n第一章正文。\n第 二 章 继续\n第二章正文。\n第３章 结束\n完。"
         let chapters = ChapterParser.chapters(in: text)

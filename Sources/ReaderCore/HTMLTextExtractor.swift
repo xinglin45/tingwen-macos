@@ -6,6 +6,10 @@ public enum HTMLTextExtractor {
         // The data initializer's HTML tidy path can discard non-ASCII characters.
         // Decode first so Chinese text reaches the parser as Unicode.
         let source = try TextDecoder.decode(data)
+        return try extract(sourceText: source)
+    }
+
+    public static func extract(sourceText source: String) throws -> String {
         let document = try XMLDocument(xmlString: source, options: [.documentTidyHTML, .nodeLoadExternalEntitiesNever])
         let skipped: Set<String> = ["head", "script", "style", "noscript", "iframe", "object", "svg"]
         let blocks: Set<String> = ["p", "div", "section", "article", "header", "footer", "main", "aside",

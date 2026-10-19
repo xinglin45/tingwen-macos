@@ -12,6 +12,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
     @Published private(set) var unavailableEntryIDs: Set<UUID> = []
     @Published private(set) var currentLibraryID: UUID?
     @Published private(set) var isAddingFiles = false
+    @Published private(set) var sourceEncodingLabel: String?
     @Published private(set) var libraryNotice: String?
     @Published private(set) var resumeMarkerOffset: Int?
     @Published var showClearLibraryConfirmation = false
@@ -175,10 +176,17 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         panel.message = "支持 TXT、Markdown、RTF、HTML、DOCX、PDF 和常见纯文本文件（最大 20 MB）。"
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
+        let encodingPicker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 230, height: 28))
+        encodingPicker.addItems(withTitles: TextEncoding.allCases.map(\.label))
+        let accessory = NSStackView(views: [NSTextField(labelWithString: "文本编码："), encodingPicker])
+        accessory.orientation = .horizontal
+        accessory.spacing = 10
+        accessory.frame = NSRect(x: 0, y: 0, width: 350, height: 32)
+        panel.accessoryView = accessory
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK else { return }
             let urls = panel.urls
-            Task { @MainActor in await self?.addFiles(urls) }
+            Task { @MainActor in await self?.addFiles(urls, encoding: TextEncoding.allCases[encodingPicker.indexOfSelectedItem]) }
         }
         if let window = NSApp.keyWindow, window.identifier?.rawValue == "reader" {
             panel.beginSheetModal(for: window, completionHandler: completion)
@@ -193,7 +201,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
     }
 
     @discardableResult
-    func load(_ url: URL, remember: Bool = true, restoringID: UUID? = nil) async -> Bool {
+    func load(_ url: URL, remember: Bool = true, restoringID: UUID? = nil, encoding: TextEncoding? = nil) async -> Bool {
         let generation = UUID()
         loadGeneration = generation
         isLoading = true
@@ -201,19 +209,24 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         let accessed = url.startAccessingSecurityScopedResource()
         defer { if accessed { url.stopAccessingSecurityScopedResource() } }
         do {
-            let loaded = try await DocumentImporter.load(url)
+            let knownID = restoringID ?? existingLibraryID(for: url)
+            let savedEncoding = library.entries.first { $0.id == knownID }?.encodingOverride.flatMap(TextEncoding.init(rawValue:))
+            let requestedEncoding = encoding ?? savedEncoding ?? .automatic
+            let imported = try await DocumentImporter.read(url, encoding: requestedEncoding, conversionDirectory: remember ? conversionDirectory : nil)
+            let loaded = imported.text
             let index = await Task.detached(priority: .userInitiated) {
                 (ChapterParser.chapters(in: loaded), (loaded as NSString).length, loaded.count, Self.digest(loaded))
             }.value
             guard generation == loadGeneration else { return false }
             stop()
-            let entry = remember ? try registerFile(url, textDigest: index.3, replacingID: restoringID, opening: true) : nil
+            let entry = remember ? try registerFile(url, textDigest: index.3, imported: imported, encoding: requestedEncoding, replacingID: restoringID, opening: true) : nil
             currentLibraryID = entry?.id
             currentDigest = index.3
             playbackCheckpoint = entry?.checkpoint
             pendingCheckpoint = false
             resumeMarkerOffset = nil
-            libraryNotice = nil
+            sourceEncodingLabel = imported.sourceEncoding?.label
+            libraryNotice = imported.convertedUTF8URL != nil ? "已将 \(imported.sourceEncoding?.label ?? "原编码") 文本自动转为 UTF-8，原文件保持不变。" : nil
             text = loaded
             documentSource = loaded as NSString
             textLength = index.1
@@ -240,10 +253,22 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
                 }
                 state = unchanged && checkpoint.finished ? .finished : .ready
                 if !unchanged {
-                    libraryNotice = restored.exact ? "文件内容已更新，已找到上次播放的位置。" : "文件内容已变化，无法准确恢复；已定位到对应章节开头。"
+                    let restoreNotice = restored.exact ? "文件内容已更新，已找到上次播放的位置。" : "文件内容已变化，无法准确恢复；已定位到对应章节开头。"
+                    libraryNotice = [libraryNotice, restoreNotice].compactMap { $0 }.joined(separator: " ")
                     playbackCheckpoint = ReadingCheckpoint(text: loaded, chapters: chapters, offset: position)
                     pendingCheckpoint = true
                     flushReadingProgress()
+                } else if checkpoint.chapterTitle != currentChapter?.title || checkpoint.chapterIndex != selectedChapterID {
+                    // A parser update can discover new chapters without changing the document.
+                    // Refresh chapter metadata while preserving the absolute position and reading date.
+                    let updated = ReadingCheckpoint(source: documentSource, chapters: chapters, offset: position, finished: checkpoint.finished)
+                    playbackCheckpoint = updated
+                    if let id = currentLibraryID, let index = library.entries.firstIndex(where: { $0.id == id }) {
+                        var next = library
+                        next.entries[index].checkpoint = updated
+                        do { try saveLibrary(next) }
+                        catch { libraryNotice = "章节进度信息保存失败：\(error.localizedDescription)" }
+                    }
                 }
             }
             return true
@@ -469,20 +494,36 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
     private func saveLibrary(_ next: ReadingLibrary) throws {
         guard canSaveLibrary else { throw CocoaError(.fileReadCorruptFile) }
         try libraryStore.save(next)
+        let unusedCopies = Set(library.entries.compactMap(\.convertedUTF8Path)).subtracting(next.entries.compactMap(\.convertedUTF8Path))
         library = next
         libraryEntries = next.sortedEntries
+        for path in unusedCopies {
+            let file = URL(fileURLWithPath: path)
+            if LibraryFiles.canonical(file.deletingLastPathComponent()) == LibraryFiles.canonical(conversionDirectory),
+               file.lastPathComponent.range(of: "^[a-f0-9]{64}\\.txt$", options: .regularExpression) != nil {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 
-    private func registerFile(_ url: URL, textDigest: String, replacingID: UUID? = nil, opening: Bool) throws -> LibraryEntry {
+    private var conversionDirectory: URL { libraryStore.url.deletingLastPathComponent().appendingPathComponent("ConvertedTexts", isDirectory: true) }
+
+    private func existingLibraryID(for url: URL) -> UUID? {
         let canonical = LibraryFiles.canonical(url)
         let identity = LibraryFiles.identity(canonical)
-        let existingID = library.entries.first { entry in
+        return library.entries.first { entry in
             if let identity, entry.fileIdentity == identity { return true }
             guard entry.path == canonical.path else { return false }
-            // A new file can occupy the old path after the original was moved.
             let resolved = LibraryFiles.resolve(bookmark: entry.bookmark, path: entry.path)
             return LibraryFiles.canonical(resolved).path == canonical.path
         }?.id
+    }
+
+    private func registerFile(_ url: URL, textDigest: String, imported: ImportedDocument,
+                              encoding: TextEncoding, replacingID: UUID? = nil, opening: Bool) throws -> LibraryEntry {
+        let canonical = LibraryFiles.canonical(url)
+        let identity = LibraryFiles.identity(canonical)
+        let existingID = existingLibraryID(for: url)
         if let replacingID, let existingID, replacingID != existingID {
             throw LibraryError.alreadyAdded
         }
@@ -494,6 +535,9 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         entry.path = canonical.path
         entry.fileIdentity = identity
         entry.bookmark = LibraryFiles.bookmark(url)
+        entry.sourceEncoding = imported.sourceEncoding?.rawValue
+        entry.encodingOverride = encoding == .automatic ? nil : encoding.rawValue
+        entry.convertedUTF8Path = imported.convertedUTF8URL?.path
         if opening { entry.lastOpenedAt = Date() }
         var next = library
         if let index = next.entries.firstIndex(where: { $0.id == entry.id }) { next.entries[index] = entry }
@@ -504,7 +548,7 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         return entry
     }
 
-    func addFiles(_ urls: [URL]) async {
+    func addFiles(_ urls: [URL], encoding: TextEncoding? = nil) async {
         guard !isAddingFiles else { return }
         isAddingFiles = true
         defer { isAddingFiles = false }
@@ -512,14 +556,17 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         var failures: [String] = []
         for url in urls {
             if !opened {
-                if await load(url) { opened = true }
+                if await load(url, encoding: encoding) { opened = true }
                 else { failures.append("\(url.lastPathComponent)：\(errorMessage ?? "无法读取")") }
             } else {
                 let accessed = url.startAccessingSecurityScopedResource()
                 do {
-                    let content = try await DocumentImporter.load(url)
-                    let digest = await Task.detached { Self.digest(content) }.value
-                    _ = try registerFile(url, textDigest: digest, opening: false)
+                    let knownID = existingLibraryID(for: url)
+                    let savedEncoding = library.entries.first { $0.id == knownID }?.encodingOverride.flatMap(TextEncoding.init(rawValue:))
+                    let requestedEncoding = encoding ?? savedEncoding ?? .automatic
+                    let imported = try await DocumentImporter.read(url, encoding: requestedEncoding, conversionDirectory: conversionDirectory)
+                    let digest = await Task.detached { Self.digest(imported.text) }.value
+                    _ = try registerFile(url, textDigest: digest, imported: imported, encoding: requestedEncoding, opening: false)
                 } catch { failures.append("\(url.lastPathComponent)：\(error.localizedDescription)") }
                 if accessed { url.stopAccessingSecurityScopedResource() }
             }
@@ -534,11 +581,11 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         await openLibraryEntry(id)
     }
 
-    func openLibraryEntry(_ id: UUID) async {
+    func openLibraryEntry(_ id: UUID, encoding: TextEncoding? = nil) async {
         guard let entry = library.entries.first(where: { $0.id == id }) else { return }
         if currentLibraryID == id { stop() } // Flush before reading this entry's saved checkpoint.
         let url = LibraryFiles.resolve(bookmark: entry.bookmark, path: entry.path)
-        await load(url, restoringID: id)
+        await load(url, restoringID: id, encoding: encoding)
     }
 
     func refreshLibraryAvailability() {
@@ -604,6 +651,15 @@ final class ReaderModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
         selectionOffset = 0
         resumeMarkerOffset = nil
         libraryNotice = nil
+        sourceEncodingLabel = nil
+    }
+
+    func showConvertedCopy(_ entry: LibraryEntry) {
+        guard let path = entry.convertedUTF8Path, FileManager.default.fileExists(atPath: path) else {
+            errorMessage = "UTF-8 副本暂不可用，请重新打开原文件以自动生成。"
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
     private func captureReadingProgress(immediate: Bool = false) {

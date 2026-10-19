@@ -244,6 +244,14 @@ struct ContentView: View {
             Menu {
                 Button("打开并恢复进度") { Task { await model.openLibraryEntry(entry.id) } }
                 Button("重新定位文件…") { model.relocateLibraryEntry(entry.id) }
+                if entry.sourceEncoding != nil {
+                    Menu("文本编码") {
+                        ForEach(TextEncoding.allCases) { encoding in
+                            Button(encoding.label) { Task { await model.openLibraryEntry(entry.id, encoding: encoding) } }
+                        }
+                    }
+                }
+                if entry.convertedUTF8Path != nil { Button("显示 UTF-8 副本") { model.showConvertedCopy(entry) } }
                 Divider()
                 Button("从书架移除", role: .destructive) { model.removeLibraryEntry(entry.id) }
             } label: { Image(systemName: "ellipsis") }
@@ -274,7 +282,7 @@ struct ContentView: View {
                 .help(showsSidebar ? "收起侧栏" : "展开侧栏").accessibilityLabel("切换侧栏")
             VStack(alignment: .leading, spacing: 4) {
                 Text(model.title).font(.headline).lineLimit(1).truncationMode(.middle)
-                Text(model.hasText ? "\(model.characterCount.formatted()) 个字符 · \(model.chapters.count) 个章节" : "选择文件，或将文件拖到这里")
+                Text(model.hasText ? "\(model.characterCount.formatted()) 个字符 · \(model.chapters.count) 个章节" + (model.sourceEncodingLabel.map { " · \($0)" } ?? "") : "选择文件，或将文件拖到这里")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)

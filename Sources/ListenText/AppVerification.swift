@@ -185,6 +185,7 @@ enum AppVerification {
                     record("real-book-result-navigation-and-highlights", model.selectedChapterID == result.chapterID && valid && !model.searchHighlights.isEmpty)
                 }
             }
+            try await verifyEncodingImport(folder: folder, record: record)
             try await verifyLibrary(folder: folder, record: record)
         } catch { record("unexpected-error", false, error.localizedDescription) }
         model.stop()
@@ -201,6 +202,65 @@ enum AppVerification {
             try? data.write(to: reportURL, options: .atomic)
         }
         NSApp.terminate(nil)
+    }
+
+    private static func verifyEncodingImport(folder: URL, record: (String, Bool, String) -> Void) async throws {
+        let libraryURL = folder.appendingPathComponent("encoding-library/library.json")
+        let first = folder.appendingPathComponent("GB18030书本.txt")
+        let second = folder.appendingPathComponent("Big5書本.txt")
+        let third = folder.appendingPathComponent("UTF16书本.txt")
+        let text = "第一章花開月圓\n這是繁體中文小說，歡迎閱讀。\n第二章繼續閱讀\n這是第二章的正文。"
+        let wideText = "第一章中文\nHello 你好🌙。\n第二章后续\n继续阅读。"
+        guard let gb = text.replacingOccurrences(of: "\n", with: "\r\n").data(using: TextEncoding.gb18030.stringEncoding!),
+              let big5 = text.data(using: TextEncoding.big5.stringEncoding!),
+              let wide = wideText.data(using: .utf16LittleEndian) else { throw DocumentError.unreadableEncoding }
+        try gb.write(to: first); try big5.write(to: second); try wide.write(to: third)
+        let reader = ReaderModel(libraryURL: libraryURL, registerShortcut: false)
+        await reader.addFiles([first, second, third])
+        record("encoding-import-auto-converts-before-library-add",
+               reader.libraryEntries.count == 3 && reader.libraryEntries.allSatisfy { $0.convertedUTF8Path != nil } &&
+               reader.chapters.count == 2 && reader.text == text, reader.errorMessage ?? "")
+        record("encoding-import-preserves-original-files",
+               try Data(contentsOf: first) == gb && Data(contentsOf: second) == big5 && Data(contentsOf: third) == wide, "")
+        guard let gbEntry = reader.libraryEntries.first(where: { $0.name == first.lastPathComponent }),
+              let bigEntry = reader.libraryEntries.first(where: { $0.name == second.lastPathComponent }),
+              let wideEntry = reader.libraryEntries.first(where: { $0.name == third.lastPathComponent }),
+              let path = gbEntry.convertedUTF8Path else {
+            record("encoding-fixtures", false, "Missing import entries"); return
+        }
+        let cached = try String(contentsOfFile: path, encoding: .utf8)
+        record("encoding-import-utf8-copy-has-correct-text-and-chapters",
+               cached == text && ChapterParser.chapters(in: cached).count == 2 &&
+               gbEntry.sourceEncoding == TextEncoding.gb18030.rawValue && bigEntry.sourceEncoding == TextEncoding.big5.rawValue, "")
+        reader.selectChapter(1); reader.seekInChapter(to: 0.3)
+        let position = reader.position
+        let reopened = ReaderModel(libraryURL: libraryURL, registerShortcut: false)
+        await reopened.restoreLastDocument()
+        record("encoding-import-relaunch-keeps-position-and-converted-copy",
+               reopened.currentLibraryID == gbEntry.id && reopened.position == position &&
+               reopened.libraryEntries.first { $0.id == gbEntry.id }?.convertedUTF8Path == path, "")
+        await reopened.openLibraryEntry(gbEntry.id, encoding: .utf8)
+        record("encoding-invalid-manual-choice-does-not-replace-book",
+               reopened.errorMessage != nil && reopened.currentLibraryID == gbEntry.id &&
+               reopened.libraryEntries.first { $0.id == gbEntry.id }?.encodingOverride == nil, "")
+        reopened.errorMessage = nil
+        await reopened.openLibraryEntry(wideEntry.id, encoding: .utf16LE)
+        let reloadManual = ReaderModel(libraryURL: libraryURL, registerShortcut: false)
+        await reloadManual.restoreLastDocument()
+        record("encoding-manual-choice-persists-on-reopen", reloadManual.text == wideText &&
+               reloadManual.libraryEntries.first { $0.id == wideEntry.id }?.encodingOverride == TextEncoding.utf16LE.rawValue, "")
+        let bad = folder.appendingPathComponent("无法识别的编码.txt")
+        try Data([0, 1, 2, 3]).write(to: bad)
+        await reopened.addFiles([bad])
+        record("encoding-failed-import-is-not-added-to-library", reopened.libraryEntries.count == 3 && reopened.errorMessage != nil, "")
+        reopened.removeLibraryEntry(gbEntry.id)
+        record("encoding-shared-copy-survives-removing-one-entry",
+               bigEntry.convertedUTF8Path == path && FileManager.default.fileExists(atPath: path), "")
+        reopened.clearLibrary()
+        record("encoding-clear-removes-only-owned-copies",
+               !FileManager.default.fileExists(atPath: path) && FileManager.default.fileExists(atPath: first.path) &&
+               FileManager.default.fileExists(atPath: second.path) && FileManager.default.fileExists(atPath: third.path), "")
+        reader.stop(); reopened.stop(); reloadManual.stop()
     }
 
     private static func verifyLibrary(folder: URL, record: (String, Bool, String) -> Void) async throws {

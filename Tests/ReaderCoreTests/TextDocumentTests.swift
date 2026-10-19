@@ -3,6 +3,44 @@ import CoreFoundation
 @testable import ReaderCore
 
 final class TextDocumentTests: XCTestCase {
+    func testDetectedLegacyEncodingAndWindowsLineEndings() throws {
+        let text = "第一章拍花造畜\r\n我是个江湖术士，号称阴脉先生。\r\n第二章阴沟里翻船\r\n中文文本。"
+        let data = try XCTUnwrap(text.data(using: TextEncoding.gb18030.stringEncoding!))
+        let decoded = try TextDecoder.decodeDetected(data)
+        XCTAssertEqual(decoded.encoding, .gb18030)
+        XCTAssertTrue(decoded.needsUTF8Conversion)
+        XCTAssertEqual(decoded.text, text.replacingOccurrences(of: "\r\n", with: "\n"))
+        XCTAssertEqual(ChapterParser.chapters(in: decoded.text).count, 2)
+    }
+
+    func testBig5IsNotMisreadAsGB18030() throws {
+        let text = "第一章花開月圓\n這是繁體中文小說，歡迎閱讀。\n第二章繼續閱讀\n中文文字。"
+        let data = try XCTUnwrap(text.data(using: TextEncoding.big5.stringEncoding!))
+        let decoded = try TextDecoder.decodeDetected(data)
+        XCTAssertEqual(decoded.encoding, .big5)
+        XCTAssertEqual(decoded.text, text)
+        XCTAssertEqual(try TextDecoder.decodeDetected(data, encoding: .big5).text, text)
+    }
+
+    func testUnicodeWithoutBOMAndManualOverride() throws {
+        let text = "第一章中文\nHello 你好🌙。"
+        for encoding in [TextEncoding.utf16LE, .utf16BE, .utf32LE, .utf32BE] {
+            let data = try XCTUnwrap(text.data(using: encoding.stringEncoding!))
+            XCTAssertEqual(try TextDecoder.decodeDetected(data).text, text)
+            XCTAssertEqual(try TextDecoder.decodeDetected(data, encoding: encoding).encoding, encoding)
+        }
+        let chineseOnly = "中文文字"
+        let data = try XCTUnwrap(chineseOnly.data(using: .utf16LittleEndian))
+        XCTAssertEqual(try TextDecoder.decodeDetected(data, encoding: .utf16LE).text, chineseOnly)
+    }
+
+    func testInvalidDeclaredEncodingIsRejectedInsteadOfLossyReplacement() {
+        XCTAssertThrowsError(try TextDecoder.decodeDetected(Data([0xEF, 0xBB, 0xBF, 0xFF])))
+        XCTAssertThrowsError(try TextDecoder.decodeDetected(Data([0xFF]), encoding: .utf8))
+        XCTAssertThrowsError(try TextDecoder.decodeDetected(Data([0xFF, 0xFE, 0x41])))
+        XCTAssertThrowsError(try TextDecoder.decodeDetected(Data([0, 1, 2, 3])))
+    }
+
     func testUTF8AndLineEndings() throws {
         let data = Data("\u{FEFF}你好\r\n世界\rHello 🌙".utf8)
         XCTAssertEqual(try TextDecoder.decode(data), "你好\n世界\nHello 🌙")
